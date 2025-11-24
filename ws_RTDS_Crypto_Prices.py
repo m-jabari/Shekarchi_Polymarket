@@ -48,7 +48,27 @@ class WebSocketOrderBook:
             on_open=self.on_open,
         )
 
-    # ------------------------------
+    # ------------------------------------------------------------------
+    # FORMATTERS
+    # ------------------------------------------------------------------
+
+    def ts_to_short(self, ts_ms):
+        dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(NY_TZ)
+        return dt.strftime("%b%d %H:%M")          # Nov14 23:00
+
+    def ts_to_time(self, ts_ms):
+        dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(NY_TZ)
+        return dt.strftime("%H:%M:%S")            # 23:14:43
+
+    def format_diff_short(self, ms_diff):
+        # MM:SS, e.g. 13:21
+        total_seconds = ms_diff // 1000
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+        return f"{minutes:02d}:{seconds:02d}"
+
+    # ------------------------------------------------------------------
+
     def on_message(self, ws, message):
         self.handle_message(message)
 
@@ -77,7 +97,8 @@ class WebSocketOrderBook:
 
         threading.Thread(target=self.ping, args=(ws,), daemon=True).start()
 
-    # ------------------------------
+    # ------------------------------------------------------------------
+
     def ping(self, ws):
         while True:
             try:
@@ -87,13 +108,8 @@ class WebSocketOrderBook:
                 break
             time.sleep(10)
 
-    # ------------------------------
-    def ts_to_human(self, ts_ms):
-        utc_dt = datetime.utcfromtimestamp(ts_ms / 1000).replace(tzinfo=pytz.utc)
-        et_dt = utc_dt.astimezone(NY_TZ)
-        return et_dt.strftime("%Y-%m-%d %H:%M:%S")
+    # ------------------------------------------------------------------
 
-    # ------------------------------
     def handle_message(self, msg):
         try:
             data = json.loads(msg)
@@ -110,48 +126,34 @@ class WebSocketOrderBook:
         base_unix_ms = self.ts_meta["et_unix"] * 1000
         end_ms = base_unix_ms + self.WINDOW_MS   # 15-minute window end
 
-        # Case 1: array of items
-        if "data" in payload:
-            for item in payload["data"]:
-                ts_ms = item.get("timestamp")
-                val = float(item.get("value"))
-                val_fmt = f"{val:.3f}"
-
-                # Countdown (not count up)
-                diff_ms = end_ms - ts_ms
-                if diff_ms < 0:
-                    diff_ms = 0
-
-                diff_fmt = format_diff(diff_ms)
-
-                print(f"{topic} {symbol} | {val_fmt} | "
-                      f"{self.ts_to_human(base_unix_ms)} | {self.ts_to_human(ts_ms)} | {diff_fmt}")
-
-        # Case 2: single update
-        elif "value" in payload and "timestamp" in payload:
+        # ------------------------------------------------------------------
+        # Case 2: single update (Polymarket format)
+        # ------------------------------------------------------------------
+        if "value" in payload and "timestamp" in payload:
             ts_ms = payload["timestamp"]
             val = float(payload["value"])
-            val_fmt = f"{val:.3f}"
+            val_fmt = f"{val:.3f}"  # 3 decimals
 
             diff_ms = end_ms - ts_ms
             if diff_ms < 0:
                 diff_ms = 0
 
-            diff_fmt = format_diff(diff_ms)
+            start_str = self.ts_to_short(base_unix_ms)      # Nov14 23:00
+            ts_str = self.ts_to_time(ts_ms)                 # 23:14:43
+            diff_str = self.format_diff_short(diff_ms)      # 13:21
 
-            print(f"{topic} {symbol} | {val_fmt} | "
-                  f"{self.ts_to_human(base_unix_ms)} | {self.ts_to_human(ts_ms)} | {diff_fmt}")
+            print(f"{start_str} {ts_str} | {diff_str} | {val_fmt}")
 
-    # ------------------------------
+    # ------------------------------------------------------------------
+
     def run(self):
         self.ws.run_forever()
 
 
-# =====================================================
+# ----------------------------------------------------------------------
 # MAIN
-# =====================================================
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
     url = "wss://ws-live-data.polymarket.com"
-
     ws_client = WebSocketOrderBook(url)
     ws_client.run()
