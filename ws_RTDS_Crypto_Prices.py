@@ -8,37 +8,19 @@ import pytz
 NY_TZ = pytz.timezone("America/New_York")
 
 
-def get_rounded_timestamps(interval_minutes=15):
-    now_utc = datetime.now(timezone.utc)
-    rounded_minute = (now_utc.minute // interval_minutes) * interval_minutes
-    rounded_utc = now_utc.replace(minute=rounded_minute, second=0, microsecond=0)
-    rounded_et = rounded_utc.astimezone(NY_TZ)
-    utc_unix = int(rounded_utc.timestamp())
-    et_unix = int(rounded_et.timestamp())
-    return {
-        "utc_time": rounded_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "utc_unix": utc_unix,
-        "et_time": rounded_et.strftime("%Y-%m-%d %I:%M:%S %p %Z"),
-        "et_unix": et_unix,
-    }
-
-
-def format_diff(ms_diff):
-    minutes = ms_diff // 60000
-    seconds = (ms_diff % 60000) // 1000
-    millis = ms_diff % 1000
-    return f"{minutes:02d}:{seconds:02d}:{millis:03d}"
-
-
 class WebSocketOrderBook:
     WINDOW_MS = 15 * 60 * 1000   # 15 minutes
 
-    def __init__(self, url, auth=None, message_callback=None, verbose=False):
+    def __init__(self, url="wss://ws-live-data.polymarket.com", auth=None, message_callback=None, verbose=False):
         self.url = url
         self.auth = auth
         self.message_callback = message_callback
         self.verbose = verbose
         self.ts_meta = None
+
+        # Persistent base value — FIXED
+        self.val_base = None
+        self.current_window_start = None
 
         self.ws = WebSocketApp(
             url,
@@ -48,40 +30,52 @@ class WebSocketOrderBook:
             on_open=self.on_open,
         )
 
-    # ------------------------------------------------------------------
-    # FORMATTERS
-    # ------------------------------------------------------------------
+    # -----------------------------
+    # Time helpers
+    # -----------------------------
+    def get_rounded_timestamps(self, interval_minutes=15):
+        """
+        Round the current UTC time down to the nearest interval (default 15 minutes)
+        and return both UTC and ET timestamps and unix values.
+        """
+        now_utc = datetime.now(timezone.utc)
+        rounded_minute = (now_utc.minute // interval_minutes) * interval_minutes
+        rounded_utc = now_utc.replace(minute=rounded_minute, second=0, microsecond=0)
+        rounded_et = rounded_utc.astimezone(NY_TZ)
+
+        return {
+            "utc_time": rounded_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "utc_unix": int(rounded_utc.timestamp()),
+            "et_time": rounded_et.strftime("%Y-%m-%d %I:%M:%S %p %Z"),
+            "et_unix": int(rounded_et.timestamp()),
+        }
 
     def ts_to_short(self, ts_ms):
         dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(NY_TZ)
-        return dt.strftime("%b%d %H:%M")          # Nov14 23:00
+        return dt.strftime("%b%d %H:%M")
 
     def ts_to_time(self, ts_ms):
         dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(NY_TZ)
-        return dt.strftime("%H:%M:%S")            # 23:14:43
+        return dt.strftime("%H:%M:%S")
 
     def format_diff_short(self, ms_diff):
-        # MM:SS, e.g. 13:21
-        total_seconds = ms_diff // 1000
-        minutes = total_seconds // 60
-        seconds = total_seconds % 60
-        return f"{minutes:02d}:{seconds:02d}"
+        sec = ms_diff // 1000
+        return f"{sec // 60:02d}:{sec % 60:02d}"
 
-    # ------------------------------------------------------------------
-
+    # -----------------------------
+    # WebSocket Handlers
+    # -----------------------------
     def on_message(self, ws, message):
         self.handle_message(message)
 
     def on_error(self, ws, error):
         print("Error:", error)
-        exit(1)
 
     def on_close(self, ws, code, msg):
         print("Connection closed")
-        exit(0)
 
     def on_open(self, ws):
-        payload = {
+        sub = {
             "action": "subscribe",
             "subscriptions": [
                 {
@@ -91,69 +85,109 @@ class WebSocketOrderBook:
                 }
             ]
         }
-
-        ws.send(json.dumps(payload))
+        ws.send(json.dumps(sub))
         print("Connected & subscribed.")
 
         threading.Thread(target=self.ping, args=(ws,), daemon=True).start()
-
-    # ------------------------------------------------------------------
 
     def ping(self, ws):
         while True:
             try:
                 ws.send("PING")
             except:
-                print("Ping failed.")
                 break
             time.sleep(10)
 
-    # ------------------------------------------------------------------
-
+    # -----------------------------
+    # Core logic with FIXED base value
+    # -----------------------------
     def handle_message(self, msg):
         try:
             data = json.loads(msg)
-        except:
-            print("Invalid JSON")
+        except json.JSONDecodeError:
             return
 
-        self.ts_meta = get_rounded_timestamps()
-
-        topic = data.get("topic", "unknown")
         payload = data.get("payload", {})
+        if "value" not in payload or "timestamp" not in payload:
+            return
+
         symbol = payload.get("symbol", "btc/usd")
 
-        base_unix_ms = self.ts_meta["et_unix"] * 1000
-        end_ms = base_unix_ms + self.WINDOW_MS   # 15-minute window end
+        # use class method instead of global function
+        self.ts_meta = self.get_rounded_timestamps()
 
-        # ------------------------------------------------------------------
-        # Case 2: single update (Polymarket format)
-        # ------------------------------------------------------------------
-        if "value" in payload and "timestamp" in payload:
-            ts_ms = payload["timestamp"]
-            val = float(payload["value"])
-            val_fmt = f"{val:.3f}"  # 3 decimals
+        # Compute new 15m window start (ET)
+        window_start_ms = self.ts_meta["et_unix"] * 1000
+        ts_ms = payload["timestamp"]
+        value = float(payload["value"])
+        value_fmt = f"{value:.3f}"
 
-            diff_ms = end_ms - ts_ms
-            if diff_ms < 0:
-                diff_ms = 0
+        # If window changed → reset base
+        if self.current_window_start != window_start_ms:
+            self.current_window_start = window_start_ms
+            self.val_base = value  # STORE BASE HERE
 
-            start_str = self.ts_to_short(base_unix_ms)      # Nov14 23:00
-            ts_str = self.ts_to_time(ts_ms)                 # 23:14:43
-            diff_str = self.format_diff_short(diff_ms)      # 13:21
+        # Calculate delta
+        delta_value = round(value - self.val_base, 3)
 
-            print(f"{start_str} {ts_str} | {diff_str} | {val_fmt}")
+        # Remaining time
+        end_ms = window_start_ms + self.WINDOW_MS
+        diff_ms = max(end_ms - ts_ms, 0)
 
-    # ------------------------------------------------------------------
+        arrow = "↑" if delta_value > 0 else "↓" if delta_value < 0 else "→"
+
+        # -----------------------------
+        # Build return values for the callback
+        # -----------------------------
+        result = {
+            "symbol": symbol,
+            "window_start_short": self.ts_to_short(window_start_ms),
+            "ts_time": self.ts_to_time(ts_ms),
+            "diff_short": self.format_diff_short(diff_ms),
+            "val_base_fmt": f"{self.val_base:.3f}",
+            "value_fmt": value_fmt,
+            "arrow": arrow,
+            "delta_value": delta_value,
+        }
+
+        # If user provided a callback, send values out
+        if self.message_callback is not None:
+            self.message_callback(result)
+        else:
+            # default behavior if no callback is passed
+            print(
+                f"{result['symbol']} | "
+                f"{result['window_start_short']} {result['ts_time']} | "
+                f"{result['diff_short']} | {result['val_base_fmt']} | "
+                f"{result['value_fmt']} | {result['arrow']} | {result['delta_value']}"
+            )
 
     def run(self):
         self.ws.run_forever()
 
 
-# ----------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------
+
 if __name__ == "__main__":
-    url = "wss://ws-live-data.polymarket.com"
-    ws_client = WebSocketOrderBook(url)
+
+    def print_order_update(data):
+        symbol = data["symbol"]
+        window_start_short = data["window_start_short"]
+        ts_time = data["ts_time"]
+        diff_short = data["diff_short"]
+        val_base_fmt = data["val_base_fmt"]
+        value_fmt = data["value_fmt"]
+        arrow = data["arrow"]
+        delta_value = data["delta_value"]
+
+        print(
+            f"{symbol} | {window_start_short} {ts_time} | "
+            f"{diff_short} | {val_base_fmt} | "
+            f"{value_fmt} | {arrow} | {delta_value}"
+        )
+
+    ws_client = WebSocketOrderBook(message_callback=print_order_update)
     ws_client.run()
+
+
+# vscode ➜ /workspaces/ubuntu $  cd /workspaces/ubuntu ; /usr/bin/env /usr/local/python/current/bin/python /home/vscode/.vscode-server/extensions/ms-python.debugpy-2025.16.0/bundled/libs/debugpy/adapter/../../debugpy/launcher 47075 -- /workspaces/ubuntu/Shekarchi_Polymarket/ws_RTDS_Crypto_Prices.py 
+# Connected & subscribed.
