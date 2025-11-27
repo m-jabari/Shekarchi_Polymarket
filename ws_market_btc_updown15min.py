@@ -694,13 +694,13 @@ if __name__ == "__main__":
 
         event_type = msg.get("event_type")
 
-        if event_type == "book":
+        if event_type == "book" :
             handle_orderbook(msg)
 
-        elif event_type == "price_change":
+        elif event_type == "price_change" :
             handle_price_change(msg)
 
-        elif event_type == "last_trade_price":
+        elif event_type == "last_trade_price" :
             handle_last_trade(msg)
 
         else:
